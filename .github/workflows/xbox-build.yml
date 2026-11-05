@@ -1,0 +1,231 @@
+# Build do RPCS3 for Xbox no fork da Beatriz Costa, pra testar mudanças no console antes de mandar PR.
+# Segue o uwp/README.md: compila no Linux com o zig e empacota no Windows.
+# O pacote sai assinado com o certificado CN=Beatriz Costa, então convive com o build oficial no Xbox.
+#
+# Tudo que vem de fora tem versão fixa e é conferido, porque o resultado sai assinado:
+# actions pelo commit exato, pacotes Python com versão fixa, Mesa e DXC por checksum,
+# FFmpeg e Vulkan-Headers pelo commit da tag, e as DLLs do DXC pela assinatura da Microsoft.
+
+name: Build Xbox
+
+on:
+  push:
+    branches: [xbox-build, 'teste/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ZIG_VERSION: 0.17.0
+  FFMPEG_TAG: n8.1
+  FFMPEG_COMMIT: 9047fa1b084f76b1b4d065af2d743df1b40dfb56
+  VULKAN_HEADERS_TAG: vulkan-sdk-1.4.363.0
+  VULKAN_HEADERS_COMMIT: 6802bb4733b63ed5efd3adb308a6c885ef180ea1
+  MESA_VERSION: 26.2.5
+  # SHA256 publicado em docs/relnotes/26.2.5.rst do Mesa.
+  MESA_SHA256: 794b3d1729075dae7ebd47c7283b7ca0cdb5dec668f7f11cc0a5d82f6138a0a5
+  DXC_VERSION: 1.9.2609.5
+  # Conferido contra o SHA512 que o NuGet publica pra essa versão.
+  DXC_SHA256: 73cfa082245918c2cc1ec6740250eb7377e83a757b3b3a3e16e0d71535bfbfc3
+
+jobs:
+  compilar:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - name: Liberar espaço em disco
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
+
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Submódulos
+        run: git submodule update --init --recursive --depth 1 --jobs 8
+
+      - name: Ferramentas
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build nasm clang-18 llvm-18 lld-18 glslang-tools bison flex
+          for t in llvm-dlltool llvm-windres llvm-nm llvm-strip llvm-ar llvm-objdump llvm-readobj llvm-rc; do sudo ln -sf /usr/bin/$t-18 /usr/local/bin/$t; done
+          sudo ln -sf /usr/bin/clang-18 /usr/local/bin/clang
+          sudo ln -sf /usr/bin/clang++-18 /usr/local/bin/clang++
+          pip install --break-system-packages "ziglang==$ZIG_VERSION" meson==1.12.1 mako==1.4.3 markupsafe==3.0.4 pyyaml==6.0.3 packaging==26.3
+          python3 -m ziglang version
+
+      - name: Chave do cache do LLVM
+        run: echo "LLVM_SHA=$(git -C 3rdparty/llvm/llvm rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      # restore e save separados: o cache fica salvo mesmo se um passo depois falhar.
+      - name: Cache do LLVM
+        id: cache-llvm
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: llvm-install
+          key: llvm-${{ env.LLVM_SHA }}-zig${{ env.ZIG_VERSION }}-${{ hashFiles('uwp/toolchain/build-llvm.sh', 'uwp/toolchain/toolchain-uwp.cmake', 'uwp/toolchain/zig-*') }}
+
+      - name: LLVM (cerca de 1 h na primeira vez)
+        if: steps.cache-llvm.outputs.cache-hit != 'true'
+        run: |
+          uwp/toolchain/build-llvm.sh llvm-build llvm-install
+          rm -rf llvm-build llvm-build-native
+          df -h /
+
+      - name: Salvar o LLVM no cache
+        if: steps.cache-llvm.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: llvm-install
+          key: ${{ steps.cache-llvm.outputs.cache-primary-key }}
+
+      - name: Cache do FFmpeg
+        id: cache-ffmpeg
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ffmpeg-install
+          key: ffmpeg-${{ env.FFMPEG_TAG }}-zig${{ env.ZIG_VERSION }}-${{ hashFiles('uwp/toolchain/build-ffmpeg.sh', 'uwp/toolchain/zig-*') }}
+
+      - name: FFmpeg
+        if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch "$FFMPEG_TAG" https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
+          test "$(git -C ffmpeg-src rev-parse HEAD)" = "$FFMPEG_COMMIT" || { echo "a tag $FFMPEG_TAG não aponta pro commit esperado"; exit 1; }
+          uwp/toolchain/build-ffmpeg.sh ffmpeg-src ffmpeg-build ffmpeg-install
+          rm -rf ffmpeg-src ffmpeg-build
+
+      - name: Salvar o FFmpeg no cache
+        if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ffmpeg-install
+          key: ${{ steps.cache-ffmpeg.outputs.cache-primary-key }}
+
+      - name: Vulkan-Headers
+        run: |
+          git clone --depth 1 --branch "$VULKAN_HEADERS_TAG" https://github.com/KhronosGroup/Vulkan-Headers.git
+          test "$(git -C Vulkan-Headers rev-parse HEAD)" = "$VULKAN_HEADERS_COMMIT" || { echo "a tag $VULKAN_HEADERS_TAG não aponta pro commit esperado"; exit 1; }
+
+      # O CMake não acha sozinho o ar e o ranlib do zig pras bibliotecas com IPO.
+      - name: RPCS3
+        run: |
+          tc=$PWD/uwp/toolchain
+          cmake -S . -B build-uwp -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=uwp/toolchain/toolchain-uwp.cmake -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_AR=$tc/zig-ar -DCMAKE_CXX_COMPILER_AR=$tc/zig-ar \
+            -DCMAKE_C_COMPILER_RANLIB=$tc/zig-ranlib -DCMAKE_CXX_COMPILER_RANLIB=$tc/zig-ranlib \
+            -DRPCS3_UWP=ON -DRPCS3_UWP_FFMPEG_LIB_DIR=$PWD/ffmpeg-install/lib \
+            -DUSE_VULKAN=ON -DRPCS3_UWP_VULKAN_INCLUDE_DIR=$PWD/Vulkan-Headers/include \
+            -DWITH_LLVM=ON -DBUILD_LLVM=OFF -DSTATIC_LINK_LLVM=ON -DLLVM_DIR=$PWD/llvm-install/lib/cmake/llvm \
+            -DUSE_NATIVE_INSTRUCTIONS=OFF -DUSE_PRECOMPILED_HEADERS=OFF \
+            -DUSE_SDL=OFF -DUSE_FAUDIO=OFF -DUSE_SYSTEM_ZLIB=OFF -DUSE_SYSTEM_CURL=OFF -DUSE_SYSTEM_SDL=OFF \
+            -DUSE_DISCORD_RPC=OFF -DUSE_GAMEMODE=OFF -DUSE_LIBEVDEV=OFF
+          ninja -C build-uwp rpcs3_uwp rpcs3_uwp_importcheck
+          df -h /
+
+      # O cross file do Mesa vem com os caminhos da máquina do desenvolvedor.
+      # O Mesa fica FORA do checkout e vira um repositório git próprio: dentro do checkout, o
+      # `git -C mesa apply` do build-mesa-dzn.sh usa a raiz do rpcs3-xbox, todo patch "falha" no
+      # --check e o script pula calado. Foi assim que o primeiro pacote saiu sem os patches do
+      # Dozen e travou com VK_ERROR_OUT_OF_HOST_MEMORY no Mortal Kombat.
+      - name: Mesa Dozen
+        run: |
+          mesa="$RUNNER_TEMP/mesa-$MESA_VERSION"
+          curl -fsSL -o mesa.tar.xz "https://archive.mesa3d.org/mesa-$MESA_VERSION.tar.xz"
+          echo "$MESA_SHA256  mesa.tar.xz" | sha256sum -c -
+          tar -xJf mesa.tar.xz -C "$RUNNER_TEMP" && rm mesa.tar.xz
+          git -C "$mesa" init -q
+          sed -i \
+            -e "s#/home/claude/RPCS3/rpcs3/uwp/toolchain#$PWD/uwp/toolchain#g" \
+            -e "s#/home/claude/uwp-port/build/uwp-implibs#$PWD/build-uwp/uwp-implibs#g" \
+            uwp/toolchain/meson-cross-uwp.ini
+          if grep -q /home/claude uwp/toolchain/meson-cross-uwp.ini; then echo "cross file ainda com caminho antigo"; exit 1; fi
+          # Aplica aqui, na mesma ordem do script (um depende do outro), com erro se algum não
+          # encaixar. Depois o script vê que já estão aplicados e pula cada um.
+          for p in $(grep -o 'apply "\$tc/mesa-dzn-[a-z-]*\.patch"' uwp/toolchain/build-mesa-dzn.sh | grep -o 'mesa-dzn-[a-z-]*\.patch'); do
+            git -C "$mesa" apply "$PWD/uwp/toolchain/$p" || { echo "patch do Mesa não aplica: $p"; exit 1; }
+            echo "aplicado: $p"
+          done
+          uwp/toolchain/build-mesa-dzn.sh "$mesa" build-dzn
+          # Confere no driver pronto as marcas dos patches (variáveis de ambiente que só eles leem).
+          for marca in DZN_PSO_LIBRARY DZN_NO_BUFPOOL; do
+            grep -q "$marca" build-dzn/src/microsoft/vulkan/vulkan_dzn.dll || { echo "vulkan_dzn.dll sem $marca: patch não entrou"; exit 1; }
+          done
+
+      - name: DXC (dxil.dll e dxcompiler.dll)
+        run: |
+          curl -fsSL -o dxc.zip "https://www.nuget.org/api/v2/package/Microsoft.Direct3D.DXC/$DXC_VERSION"
+          echo "$DXC_SHA256  dxc.zip" | sha256sum -c -
+          mkdir dxc && cd dxc && unzip -q ../dxc.zip
+          find . -iname 'dxil.dll' -o -iname 'dxcompiler.dll' -o -iname '*license*'
+
+      # Publisher igual ao subject do certificado. Com outro Publisher o Xbox trata como outro app.
+      - name: Layout do pacote
+        run: |
+          m=uwp/package/AppxManifest.xml
+          sed -i \
+            -e 's#Publisher="CN=RPCS3XboxProbe"#Publisher="CN=Beatriz Costa"#' \
+            -e 's#RPCS3 Xbox (Beta)#RPCS3 Xbox (Beatriz)#g' \
+            -e 's#<PublisherDisplayName>[^<]*</PublisherDisplayName>#<PublisherDisplayName>Beatriz Costa</PublisherDisplayName>#' \
+            "$m"
+          grep -q 'CN=Beatriz Costa' "$m" && grep -q 'RPCS3 Xbox (Beatriz)' "$m" || { echo "manifest mudou no upstream"; exit 1; }
+          # Cada build com um número maior, pra instalar por cima do anterior sem desinstalar.
+          sed -i -E "s#(<Identity [^>]*Version=\"[0-9]+\.[0-9]+\.[0-9]+)\.[0-9]+\"#\1.$((1000 + GITHUB_RUN_NUMBER))\"#" "$m"
+          grep -o '<Identity [^>]*>' "$m"
+          dxil=$(find dxc -ipath '*x64*' -iname dxil.dll | head -1)
+          dxcomp=$(find dxc -ipath '*x64*' -iname dxcompiler.dll | head -1)
+          lic=$(find dxc -iname 'LICENSE-MS.txt' -o -iname 'LICENSE*.txt' | head -1)
+          cp "$lic" DXIL-LICENSE.txt
+          export UWP_EXTRA_FILES="build-dzn/src/microsoft/vulkan/vulkan_dzn.dll:$dxil:$dxcomp:DXIL-LICENSE.txt"
+          python3 uwp/package/make_layout.py build-uwp/bin/rpcs3_uwp.exe . layout
+          du -sh layout && ls layout
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: layout
+          path: layout
+          retention-days: 3
+
+  empacotar:
+    needs: compilar
+    runs-on: windows-2022
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: layout
+          path: layout
+
+      # As DLLs do DXC têm que continuar com a assinatura da Microsoft antes de irem pro pacote assinado.
+      - name: Conferir as DLLs da Microsoft
+        run: |
+          foreach ($dll in 'dxil.dll', 'dxcompiler.dll') {
+            $s = Get-AuthenticodeSignature "layout\$dll"
+            "$dll : $($s.Status) | $($s.SignerCertificate.Subject)"
+            if ($s.Status -ne 'Valid' -or $s.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') { throw "$dll sem assinatura válida da Microsoft" }
+          }
+
+      - name: Empacotar e assinar
+        env:
+          PFX_BASE64: ${{ secrets.XBOX_PFX_BASE64 }}
+          PFX_SENHA: ${{ secrets.XBOX_PFX_SENHA }}
+        run: |
+          $sdk = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Directory | Where-Object Name -match '^10\.' | Sort-Object Name | Select-Object -Last 1
+          $bin = Join-Path $sdk.FullName 'x64'
+          $versao = ([xml](Get-Content layout\AppxManifest.xml)).Package.Identity.Version
+          New-Item -ItemType Directory saida | Out-Null
+          $appx = "saida\RPCS3Xbox-Beatriz-$versao.appx"
+          & "$bin\makeappx.exe" pack /d layout /p $appx /o
+          if ($LASTEXITCODE) { throw 'makeappx falhou' }
+          [IO.File]::WriteAllBytes("$PWD\assinatura.pfx", [Convert]::FromBase64String($env:PFX_BASE64))
+          & "$bin\signtool.exe" sign /fd SHA256 /f assinatura.pfx /p $env:PFX_SENHA $appx
+          $ok = $LASTEXITCODE
+          Remove-Item assinatura.pfx
+          if ($ok) { throw 'signtool falhou' }
+          Get-ChildItem saida | Format-Table Length, Name -AutoSize
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rpcs3-xbox-beatriz
+          path: saida
